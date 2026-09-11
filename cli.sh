@@ -29,10 +29,20 @@ choose_backend() {
         echo "  Or change:  sudo snap set llama-cpp backend=auto" >&2
         exit 2
       fi
+      if [ "$req" = "hip" ] && [ ! -d "$SNAP/opt/rocm/lib" ]; then
+        echo "llama-cpp: backend='hip' selected but the ROCm runtime content provider is not connected." >&2
+        echo "  Install it: sudo snap install rocm-inference" >&2
+        echo "  Connect it: sudo snap connect llama-cpp:rocm rocm-inference:runtime" >&2
+        echo "  Or change:  sudo snap set llama-cpp backend=auto" >&2
+        exit 2
+      fi
       echo "$req"; return ;;
     auto)
       for c in hip cuda vulkan opencl; do
         if [ -f "$SNAP_COMPONENTS/$c/lib/ggml/backends/libggml-$c.so" ]; then
+          if [ "$c" = "hip" ] && [ ! -d "$SNAP/opt/rocm/lib" ]; then
+            continue
+          fi
           echo "$c"; return
         fi
       done
@@ -48,10 +58,9 @@ if [ -n "$backend" ]; then
   export GGML_BACKEND_PATH="$SNAP_COMPONENTS/$backend/lib/ggml/backends/libggml-$backend.so"
   export LD_LIBRARY_PATH="$SNAP_COMPONENTS/$backend/lib:${LD_LIBRARY_PATH:-}"
   if [ "$backend" = "hip" ]; then
-    rocm="$SNAP_COMPONENTS/hip/opt/rocm"
-    export ROCM_PATH="$rocm"
-    export HIP_PATH="$rocm"
-    export LD_LIBRARY_PATH="$rocm/lib:$rocm/lib/llvm/lib:$rocm/lib/rocm_sysdeps/lib:$LD_LIBRARY_PATH"
+    export ROCM_PATH="$SNAP/opt/rocm"
+    export HIP_PATH="$ROCM_PATH"
+    export LD_LIBRARY_PATH="$ROCM_PATH/lib:$ROCM_PATH/lib/llvm/lib:$ROCM_PATH/lib/rocm_sysdeps/lib:$LD_LIBRARY_PATH"
   fi
 fi
 

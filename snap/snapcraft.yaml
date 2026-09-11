@@ -40,6 +40,11 @@ confinement: strict
 lint:
   ignore:
     - classic
+plugs:
+  rocm:
+    interface: content
+    content: rocm-inference-10-0-2604
+    target: $SNAP/opt/rocm
 environment:
   # Used by cli.sh and baked into the snap by snapcraft (expanded at build).
   ARCH_TRIPLET: $CRAFT_ARCH_TRIPLET_BUILD_FOR
@@ -59,9 +64,10 @@ components:
     type: standard
     summary: AMD GPU (HIP/ROCm) backend
     description: |
-      Adds libggml-hip.so plus the ROCm runtime libraries so llama.cpp
-      can offload to AMD GPUs. Built for the same llama.cpp source tag
-      as the parent snap to guarantee ABI compatibility.
+      Adds libggml-hip.so so llama.cpp can offload to AMD GPUs using the
+      ROCm runtime supplied by the rocm-inference content snap. Built for
+      the same llama.cpp source tag as the parent snap to guarantee ABI
+      compatibility.
   cuda:
     type: standard
     summary: NVIDIA GPU (CUDA) backend
@@ -106,6 +112,9 @@ apps:
       # llama.cpp pins worker threads with sched_setaffinity. Without this
       # application fails to init.
       - process-control
+      # ROCm is shared by a content provider instead of duplicated in every
+      # consuming snap. Requires an explicit `snap connect` from the user.
+      - rocm
 parts:
   # --- Wrapper script ------------------------------------------------------
   cli:
@@ -200,12 +209,13 @@ parts:
       usr/bin/llama-*: bin/
   # --- ggml HIP backend, organised into the `hip` component ----------------
   # Same upstream source-tag as ggml-cpu for ABI compatibility. Only
-  # libggml-hip.so + ROCm runtime libs are routed into the component; the
+  # libggml-hip.so is routed into the component; ROCm is used directly from
+  # the build snap and supplied at runtime through the content interface.
   # local libggml.so / libggml-base.so / ggml-config.cmake this build also
   # produces are filtered at the `stage:` step so they do not collide with
   # ggml-cpu's copies in the default partition.
-  # amd64-only: the build no-ops on other arches (see rocm-libs), leaving the
-  # organize keys with nothing to match, so the hip component is empty there.
+  # amd64-only: the build no-ops on other arches, leaving the organize key
+  # with nothing to match, so the hip component is empty there.
   ggml-hip:
     source: https://github.com/ggml-org/llama.cpp.git
     source-tag: v0.4.0
@@ -215,25 +225,16 @@ parts:
     build-packages:
       - pkg-config
       - pkg-rocm-tools
-    stage-snaps:
-      - rocm-inference/latest/beta
+    build-snaps:
+      - on amd64 to amd64:
+        - rocm-inference/latest/beta
     # Same standalone-files workaround as ggml-cpu — see comment there.
     override-pull: |
       craftctl default
       sed -i 's/^    set(GGML_STANDALONE ON)/    set(GGML_STANDALONE OFF)/' \
         "${CRAFT_PART_SRC}/ggml/CMakeLists.txt"
-    cmake-parameters:
-      - -DCMAKE_INSTALL_PREFIX=/usr
-      - -DCMAKE_BUILD_TYPE=Release
-      - -DBUILD_SHARED_LIBS=ON
-      - -DGGML_BACKEND_DL=ON
-      - -DGGML_CPU=OFF
-      - -DGGML_HIP=ON
-      - -DGGML_NATIVE=OFF
-      - -DGGML_BUILD_TESTS=OFF
-      - -DGGML_BUILD_EXAMPLES=OFF
     build-environment:
-      - ROCM_PATH: "$CRAFT_STAGE/opt/rocm"
+      - ROCM_PATH: "/snap/rocm-inference/current/opt/rocm"
       - HIP_PATH: "$ROCM_PATH"
       - HIPCXX: "$ROCM_PATH/lib/llvm/bin/clang++"
       - PATH: "$ROCM_PATH/bin:$ROCM_PATH/lib/llvm/bin:$PATH"
@@ -249,16 +250,27 @@ parts:
         | xargs printf "%s;" \
         | awk '{ print substr( $0, 1, length($0)-1 ) }'
       )
-      export CRAFT_CMAKE_ARGS="-DGPU_TARGETS=$GPU_TARGETS -DCMAKE_PREFIX_PATH=$ROCM_PATH"
-      craftctl default
-      mkdir -p "$CRAFT_PART_INSTALL/opt/rocm"
-      cp -a "$ROCM_PATH/lib" "$CRAFT_PART_INSTALL/opt/rocm/lib"
+      cmake -S "$CRAFT_PART_SRC/ggml" -B "$CRAFT_PART_BUILD" \
+        -G "Unix Makefiles" \
+        -DCMAKE_INSTALL_PREFIX=/usr \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DBUILD_SHARED_LIBS=ON \
+        -DGGML_BACKEND_DL=ON \
+        -DGGML_CPU=OFF \
+        -DGGML_HIP=ON \
+        -DGGML_NATIVE=OFF \
+        -DGGML_BUILD_TESTS=OFF \
+        -DGGML_BUILD_EXAMPLES=OFF \
+        -DGGML_HIP_ROCWMMA_FATTN=OFF \
+        -DGPU_TARGETS="$GPU_TARGETS" \
+        -DCMAKE_HIP_ARCHITECTURES="$GPU_TARGETS" \
+        -DCMAKE_PREFIX_PATH="$CRAFT_STAGE;$ROCM_PATH"
+      cmake --build "$CRAFT_PART_BUILD" -- -j"$CRAFT_PARALLEL_BUILD_COUNT"
+      DESTDIR="$CRAFT_PART_INSTALL" cmake --build "$CRAFT_PART_BUILD" --target install
     organize:
       # Without GGML_BACKEND_DIR, ggml installs the HIP backend to
       # CMAKE_INSTALL_BINDIR (usr/bin/). Route it into the component.
       usr/bin/libggml-hip.so: (component/hip)/lib/ggml/backends/libggml-hip.so
-      # catch-all for ROCm runtime libraries
-      opt/rocm: (component/hip)/opt/rocm
     # Drop the ggml-internal artifacts this build also produces. ggml-cpu
     # already owns libggml.so, libggml-base.so, the ggml-config.cmake, the
     # pkgconfig, and the headers — and the hip-built copies differ in content
@@ -270,10 +282,6 @@ parts:
       - -usr/lib/*/libggml.so*
       - -usr/lib/*/libggml-base.so*
       - -usr/lib/*/ggml/backends0/libggml-cpu*
-      - -opt/rocm/lib/**/include
-      - -opt/rocm/lib/**/cmake
-      - -opt/rocm/lib/**/pkgconfig
-      - -opt/rocm/lib/**/*.a
   # --- ggml CUDA backend, organised into the `cuda` component --------------
   # Same shape as ggml-hip: same upstream source-tag for ABI parity with
   # ggml-cpu, same standalone-files sed, same catch-all organize, same
